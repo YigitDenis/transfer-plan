@@ -3,7 +3,43 @@ import pandas as pd
 from io import BytesIO
 import re
 
+# -------------------------
+# PAGE CONFIG
+# -------------------------
 st.set_page_config(page_title="Transfer Planı", layout="wide")
+
+# -------------------------
+# HACKER THEME (CSS)
+# -------------------------
+def apply_hacker_theme():
+    st.markdown(
+        """
+        <style>
+        .stApp { background: #070A0F; color: #D7FFE7; }
+        h1, h2, h3, h4 { color: #39FF14 !important; letter-spacing: .5px; }
+        [data-testid="stMetricValue"] { color: #39FF14 !important; }
+        [data-testid="stMetricLabel"] { color: #B8FFC0 !important; }
+        .stButton>button {
+            background: #0F1A12; border: 1px solid #39FF14; color: #39FF14;
+            border-radius: 12px; padding: 10px 14px;
+        }
+        .stButton>button:hover { background: #122417; }
+        [data-testid="stDataFrame"] { border: 1px solid #1C3A26; border-radius: 12px; }
+        .stDownloadButton>button {
+            background: #0F1A12; border: 1px solid #39FF14; color: #39FF14;
+            border-radius: 12px; padding: 10px 14px;
+        }
+        .stDownloadButton>button:hover { background: #122417; }
+        </style>
+        """,
+        unsafe_allow_html=True
+    )
+
+apply_hacker_theme()
+
+# -------------------------
+# HEADER
+# -------------------------
 st.title("Mağazalar Arası Transfer Planı")
 
 INTERNET_STORE_NAME = "Internet Mağaza"
@@ -32,13 +68,50 @@ OUTPUT_COLS = [
     "Alan mağaza",
 ]
 
+# -------------------------
+# EXCEL TEMPLATE (DOWNLOAD)
+# -------------------------
+def make_template_excel_bytes() -> bytes:
+    template = pd.DataFrame([
+        {
+            "MağazaAdı": "İzmir Alsancak Mağaza",
+            "ÜrünKodu": "SKU123",
+            "ÜrünAdı": "Örnek Ürün",
+            "RenkKodu": "001",
+            "RenkAçıklaması": "Siyah",
+            "Beden": "M",
+            "NetMiktar": 5,
+            "Envanter": 2,
+        }
+    ])
+
+    out = BytesIO()
+    with pd.ExcelWriter(out, engine="openpyxl") as writer:
+        template.to_excel(writer, index=False, sheet_name="TEMPLATE")
+    return out.getvalue()
+
+with st.container():
+    st.subheader("🧩 Excel Şablonu")
+    c1, c2 = st.columns([1, 2])
+    with c1:
+        st.download_button(
+            label="⬇️ Şablonu indir (Excel)",
+            data=make_template_excel_bytes(),
+            file_name="transfer_template.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+    with c2:
+        st.caption("Şablonu indir → doldur → aşağıdan yükle. (Kolon isimlerini değiştirmeyin)")
+
+st.divider()
+
+# -------------------------
+# HELPERS
+# -------------------------
 def norm_col(name: str) -> str:
-    """
-    Kolon adlarını normalize eder:
-    - \n, \t, boşluk, NBSP vb. tüm whitespace karakterlerini siler
-    """
+    """Tüm whitespace karakterlerini (boşluk, \\n, \\t vs.) siler."""
     name = str(name)
-    name = re.sub(r"\s+", "", name, flags=re.UNICODE)  # tüm whitespace -> sil
+    name = re.sub(r"\s+", "", name, flags=re.UNICODE)
     return name
 
 def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -52,7 +125,6 @@ def normalize_numeric(series: pd.Series) -> pd.Series:
     return s.round(0).astype(int)
 
 def to_internal_schema(df_raw: pd.DataFrame) -> pd.DataFrame:
-    # df_raw kolonları zaten normalize edildi varsayımı
     rename_map = {
         "MağazaAdı": "Mağaza",
         "ÜrünKodu": "Ürün kodu",
@@ -78,22 +150,19 @@ def to_internal_schema(df_raw: pd.DataFrame) -> pd.DataFrame:
 
 def build_transfers(df: pd.DataFrame, max_per_row: int = 4) -> pd.DataFrame:
     out_rows = []
-    cadde_received_per_sku = {}  # Cadde'ye SKU bazlı gelen toplam
+    cadde_received_per_sku = {}
 
     group_cols = ["Ürün kodu", "Ürün adı", "Renk kodu", "Renk adı", "Beden"]
 
     for _, g in df.groupby(group_cols, dropna=False):
         g = g.copy()
 
-        # Internet Mağaza: beden bazlı stok >=10 ise bu ürün+beden için transfer yok
         internet_rows = g[g["Mağaza"] == INTERNET_STORE_NAME]
         if not internet_rows.empty and int(internet_rows.iloc[0]["Stok"]) >= 10:
             continue
 
-        # Alıcı: Satış>Stok ve Stok<4
         g["eligible_receive"] = (g["Satış"] > g["Stok"]) & (g["Stok"] < 4)
 
-        # Need (alım hakkı)
         g["need"] = 0
         stock0_mask = (g["Stok"] == 0) & (g["Satış"] > 0) & g["eligible_receive"]
         g.loc[stock0_mask, "need"] = g.loc[stock0_mask, "Satış"] * 2
@@ -101,7 +170,6 @@ def build_transfers(df: pd.DataFrame, max_per_row: int = 4) -> pd.DataFrame:
         normal_mask = (~stock0_mask) & g["eligible_receive"]
         g.loc[normal_mask, "need"] = (g.loc[normal_mask, "Satış"] - g.loc[normal_mask, "Stok"]).clip(lower=0)
 
-        # Gönderici: Satış=0 veya Stok>Satış
         g["sendable"] = 0
         sales0 = g["Satış"] == 0
         g.loc[sales0, "sendable"] = g.loc[sales0, "Stok"]
@@ -121,7 +189,8 @@ def build_transfers(df: pd.DataFrame, max_per_row: int = 4) -> pd.DataFrame:
             kind="mergesort",
         )
 
-        suppliers = g[g["sendable"] > 0].copy()
+        # ✅ Internet Mağaza ASLA gönderen olamaz
+        suppliers = g[(g["sendable"] > 0) & (g["Mağaza"] != INTERNET_STORE_NAME)].copy()
         if suppliers.empty:
             continue
 
@@ -151,7 +220,6 @@ def build_transfers(df: pd.DataFrame, max_per_row: int = 4) -> pd.DataFrame:
 
                 qty = min(remaining_need, available, max_per_row)
 
-                # Cadde mağaza: SKU bazında max 3 adet alır
                 if recv_store == CADDE_STORE_NAME:
                     sku = r["Ürün kodu"]
                     used = cadde_received_per_sku.get(sku, 0)
@@ -188,14 +256,11 @@ def build_transfers(df: pd.DataFrame, max_per_row: int = 4) -> pd.DataFrame:
 
     return pd.DataFrame(out_rows, columns=OUTPUT_COLS)
 
-
 # ---------------- UI ----------------
-uploaded_file = st.file_uploader("Rapor dosyasını yükle (Excel)", type=["xlsx"])
+uploaded_file = st.file_uploader("📥 Rapor dosyasını yükle (Excel)", type=["xlsx"])
 
 if uploaded_file:
     df_raw = pd.read_excel(uploaded_file)
-
-    # ✅ Kolonları normalize et (satır atlaması/boşluklar gider)
     df_raw = normalize_columns(df_raw)
 
     missing = [c for c in REQUIRED_NORM_COLS if c not in df_raw.columns]
@@ -207,15 +272,18 @@ if uploaded_file:
     df = to_internal_schema(df_raw)
 
     st.success("Dosya formatı doğru. (Kolonlar normalize edildi)")
-    st.subheader("Yüklenen Veri")
+    st.subheader("🧾 Yüklenen Veri")
     st.dataframe(df, use_container_width=True)
 
-    if st.button("Başlat"):
+    if st.button("🚀 Başlat"):
         st.info("Kurallar çalıştırılıyor...")
 
         output = build_transfers(df, max_per_row=4)
 
-        st.subheader("Transfer Çıktısı")
+        st.session_state["input_df"] = df
+        st.session_state["transfer_df"] = output
+
+        st.subheader("📦 Transfer Çıktısı")
         st.dataframe(output, use_container_width=True)
 
         buffer = BytesIO()
@@ -224,10 +292,102 @@ if uploaded_file:
         buffer.seek(0)
 
         st.download_button(
-            label="Çıktıyı Excel olarak indir",
+            label="⬇️ Çıktıyı Excel olarak indir",
             data=buffer,
             file_name="transfer_cikti.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
+
+        st.divider()
+
+        # -------------------------
+        # SUMMARY AREA
+        # -------------------------
+        st.subheader("📊 Özet Panel")
+
+        input_df = st.session_state.get("input_df")
+        transfer_df = st.session_state.get("transfer_df")
+
+        total_net_sales = int(input_df["Satış"].sum()) if input_df is not None and not input_df.empty else 0
+        total_inventory = int(input_df["Stok"].sum()) if input_df is not None and not input_df.empty else 0
+
+        if transfer_df is not None and not transfer_df.empty and "Gönderilen adet" in transfer_df.columns:
+            transfer_df["Gönderilen adet"] = pd.to_numeric(
+                transfer_df["Gönderilen adet"], errors="coerce"
+            ).fillna(0).astype(int)
+            total_ship_units = int(transfer_df["Gönderilen adet"].sum())
+        else:
+            total_ship_units = 0
+
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Net Satış (Toplam)", f"{total_net_sales}")
+        m2.metric("Envanter / Stok (Toplam)", f"{total_inventory}")
+        m3.metric("Gönderilecek Ürün Adedi (Toplam)", f"{total_ship_units}")
+
+        # ✅ En çok transfer yapılan Ürün Kodu + Ürün Adı + Renk (+ adet)
+        st.markdown("### 🏆 En Çok Transfer Yapılan Ürün (Kod + Ürün + Renk)")
+        if transfer_df is None or transfer_df.empty:
+            st.info("Transfer yok, en çok transfer yapılan ürün bulunamadı.")
+        else:
+            top_product = (
+                transfer_df.groupby(["Ürün kodu", "Ürün adı", "Renk adı"], as_index=False)["Gönderilen adet"]
+                .sum()
+                .sort_values("Gönderilen adet", ascending=False)
+                .head(1)
+            )
+            if top_product.empty:
+                st.info("Transfer yok, en çok transfer yapılan ürün bulunamadı.")
+            else:
+                tp = top_product.iloc[0]
+                st.dataframe(
+                    pd.DataFrame([{
+                        "Ürün kodu": tp["Ürün kodu"],
+                        "Ürün adı": tp["Ürün adı"],
+                        "Renk adı": tp["Renk adı"],
+                        "Transfer adedi": int(tp["Gönderilen adet"])
+                    }]),
+                    use_container_width=True
+                )
+
+        st.markdown("### 🔽 Net Satış / Envanter / Gönderilecek Adet (Toplam)")
+        totals_df = pd.DataFrame([{
+            "Net Satış": total_net_sales,
+            "Envanter": total_inventory,
+            "Gönderilecek Ürün Adedi": total_ship_units
+        }])
+        st.dataframe(totals_df, use_container_width=True)
+
+        st.markdown("### ✅ Alan Mağaza Özeti")
+        if transfer_df is None or transfer_df.empty:
+            st.info("Transfer çıktısı boş. (Özet tablo oluşmadı)")
+        else:
+            recv_summary = (
+                transfer_df.groupby("Alan mağaza", as_index=False)["Gönderilen adet"]
+                .sum()
+                .rename(columns={"Gönderilen adet": "Alınan adet"})
+                .sort_values("Alınan adet", ascending=False)
+            )
+            st.dataframe(recv_summary, use_container_width=True)
+
+            st.markdown("### 🚚 Gönderen Mağaza Özeti")
+            send_summary = (
+                transfer_df.groupby("Gönderen mağaza", as_index=False)["Gönderilen adet"]
+                .sum()
+                .rename(columns={"Gönderilen adet": "Gönderilen adet"})
+                .sort_values("Gönderilen adet", ascending=False)
+            )
+            st.dataframe(send_summary, use_container_width=True)
+
+            st.markdown("### 🔁 Gönderen → Alan Kırılımı")
+            pivot = pd.pivot_table(
+                transfer_df,
+                index="Gönderen mağaza",
+                columns="Alan mağaza",
+                values="Gönderilen adet",
+                aggfunc="sum",
+                fill_value=0
+            )
+            st.dataframe(pivot, use_container_width=True)
+
 else:
     st.caption("Excel'i yükleyin, sonra Başlat'a basın.")
